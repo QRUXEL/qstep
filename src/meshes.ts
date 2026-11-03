@@ -25,8 +25,10 @@ export interface FaceRange {
 export interface BodyMesh {
   /** the solid's entity id (shared by every placement of it) */
   solid: number;
-  /** the product's name (the solid's, when the product has several) */
+  /** OpenCascade's name for the mesh: the product's, empty for the solids of a product with several */
   name: string;
+  /** a name to show: the solid's own, else the product's */
+  label: string;
   /** the assembly path to the product that holds the solid */
   path: AssemblyNode[];
   placement: Xf;
@@ -116,8 +118,10 @@ export function readMeshes(f: StepFile, opt: MeshOptions = {}): MeshModel {
     const leaf = inst.path[inst.path.length - 1];
     bodies.push({
       solid: inst.solid,
-      // the product's name, as OpenCascade names its meshes; a product with several solids names each by its solid
-      name: (leaf.solids.length > 1 && assembly.solidNames.get(inst.solid)) || leaf.name || assembly.solidNames.get(inst.solid) || '',
+      // as OpenCascade names its meshes (stored body ids are made from them): the product's name,
+      // none for the solids of a product that has several
+      name: leaf.solids.length > 1 ? '' : leaf.name || assembly.solidNames.get(inst.solid) || '',
+      label: assembly.solidNames.get(inst.solid) || leaf.name || '',
       path: inst.path, placement: inst.placement,
       color: assembly.colors.get(inst.solid),
       pos, nor, idx, faces: m.faces,
