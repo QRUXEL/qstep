@@ -3,3 +3,4 @@ export * from "./nurbs";
 export * from "./brep";
 export * from "./geom/clip";
 export * from "./assembly";
+export * from "./board";

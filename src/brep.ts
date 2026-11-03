@@ -118,6 +118,51 @@ export function readModel(f: StepFile, opt: ReadOptions = {}): StepModel {
     }
   }
 
+  // ---- solids
+  const brepIds = [...(f.byType.get('MANIFOLD_SOLID_BREP') || []), ...(f.byType.get('BREP_WITH_VOIDS') || [])];
+  if (!brepIds.length) {
+    const shells = f.byType.get('SHELL_BASED_SURFACE_MODEL');
+    throw new StepError(shells ? 'The file holds surface models, not solids. Export the parts as solid bodies.' : 'No solid bodies were found in the file.');
+  }
+  const unsupportedXf = (f.byType.get('ITEM_DEFINED_TRANSFORMATION') || []).length;
+  if (unsupportedXf) warnings.push(`The file contains ${unsupportedXf} assembly placement(s); parts are read at their stored positions.`);
+  const parts = solidParts(f, brepIds, { chordTol, zTol, mmPer, point: turn, dir: turn }, warnings);
+
+  const bx = parts.map((p) => p.bbox);
+  const fn = f.header.FILE_NAME;
+  return {
+    source: fn ? String((fn[3] as Value[])?.[0] ?? fn[0] ?? '') : '',
+    unit, parts, warnings, turned,
+    bbox: [Math.min(...bx.map((b) => b[0])), Math.min(...bx.map((b) => b[1])), Math.max(...bx.map((b) => b[2])), Math.max(...bx.map((b) => b[3]))],
+    thickness: Math.max(...parts.map((p) => p.thickness)),
+  };
+}
+
+/** How a solid is read: file points (already in mm) and directions into the frame its faces are analysed in. */
+export interface SolidFrame {
+  point: (p: V3) => V3;
+  dir: (d: V3) => V3;
+}
+
+/**
+ * Reads solids into parts, with their thickness along Z of the given frame:
+ * every face, the 2.5D analysis (outline, holes, pockets, top and bottom
+ * faces) and a mesh, all in that frame. Throws a StepError for a solid it
+ * can't read as a board.
+ */
+export function solidParts(f: StepFile, ids: number[], o: { chordTol: number; zTol: number; mmPer: number } & SolidFrame, warnings: string[]): Part[] {
+  const { chordTol, zTol, mmPer } = o;
+  const turn = o.point, turnDir = o.dir;
+  const E = f.entities;
+  const ent = (v: Value, ctx: string): Entity => {
+    if (!(v instanceof Ref)) throw new StepError(`${ctx}: expected a reference`);
+    const e = E.get(v.id);
+    if (!e) throw new StepError(`${ctx}: #${v.id} is missing from the file`);
+    return e;
+  };
+  const num = (v: Value) => (v instanceof Typed ? Number(v.args[0]) : Number(v));
+  const bool = (v: Value) => v instanceof Enum && v.v === 'T';
+
   // ---- cached geometry lookups
   const ptCache = new Map<number, V3>();
   const point = (v: Value): V3 => {
@@ -135,7 +180,7 @@ export function readModel(f: StepFile, opt: ReadOptions = {}): StepModel {
     const e = ent(v, 'direction');
     if (e.type !== 'DIRECTION') throw new StepError(`expected DIRECTION, got ${e.type} (#${e.id})`);
     const c = e.args[1] as number[];
-    return norm(turn([c[0], c[1], c[2] ?? 0]));
+    return norm(turnDir([c[0], c[1], c[2] ?? 0]));
   };
   interface Frame { o: V3; x: V3; y: V3; z: V3 }
   const frame = (v: Value): Frame => {
@@ -258,7 +303,7 @@ export function readModel(f: StepFile, opt: ReadOptions = {}): StepModel {
 
   // ---- faces
   interface Face {
-    id: number; kind: 'plane' | 'cylinder' | 'cone' | 'spline';
+    id: number; kind: 'plane' | 'cylinder' | 'cone' | 'spline' | 'other';
     loops: V3[][]; outer: number;   // index of the outer loop
     n?: V3;                          // plane normal (oriented)
     nz: number;                      // representative normal z (sign tells up/down)
@@ -266,15 +311,21 @@ export function readModel(f: StepFile, opt: ReadOptions = {}): StepModel {
     flat: boolean;                   // horizontal plane
     surf: { F: Frame; r?: number; ang?: number; sign: number; S?: Surface };
   }
+  // Mean normal z over a face's boundary points: a side face that leans up
+  // (a rounded-over top edge) counts towards the footprint, one that faces
+  // sideways (a hole drilled into the edge) doesn't.
+  const meanNz = (loops: V3[][], normalAt: (p: V3) => V3) => {
+    const pts = loops.flat();
+    const nz = pts.reduce((sum, p) => sum + normalAt(p)[2], 0) / Math.max(1, pts.length);
+    return Math.abs(nz) < 0.02 ? 0 : nz;
+  };
   const face = (e: Entity): Face => {
     if (e.type !== 'ADVANCED_FACE' && e.type !== 'FACE_SURFACE') throw new StepError(`unsupported face ${e.type} (#${e.id})`);
     const s = ent(e.args[2], 'surface');
     const sp = splineSurface(s);
     if (sp) return splineFace(e, sp);
-    if (!SUPPORTED_SURFACES.has(s.type)) {
-      throw new StepError(`Surface type ${s.parts ? Object.keys(s.parts).join(' + ') : s.type} is not supported yet (face #${e.id}). Supported: plane, cylinder, cone, B-spline.`);
-    }
     const sign = bool(e.args[3]) ? 1 : -1;
+    if (!SUPPORTED_SURFACES.has(s.type)) return otherFace(e, s, sign);
     const F = frame(s.args[1]);
     const loops: V3[][] = [];
     let outer = -1;
@@ -300,14 +351,44 @@ export function readModel(f: StepFile, opt: ReadOptions = {}): StepModel {
       return { id: e.id, kind: 'plane', loops, outer, n, nz: n[2], z: zs.reduce((a, b) => a + b, 0) / zs.length, flat: Math.abs(n[2]) > 0.999 && flatZ, surf: { F, sign } };
     }
     const r = num(s.args[2]) * mmPer;
+    const ang = s.type === 'CONICAL_SURFACE' ? num(s.args[3]) : 0; // semi-angle (radians in plane-angle unit)
     if (Math.abs(F.z[2]) < 0.999) {
-      throw new StepError(`A ${s.type === 'CONICAL_SURFACE' ? 'cone' : 'cylinder'} that isn't vertical was found (face #${e.id}). Only 2.5D parts (straight through the board) are supported.`);
+      // Not straight through the board (a hole into an edge, a rounded-over edge): a side face.
+      const normalAt = (p: V3): V3 => {
+        const d = sub(p, F.o);
+        const radial = norm(sub(d, scale(F.z, dot(d, F.z))));
+        return scale(ang ? norm(sub(radial, scale(F.z, Math.tan(ang)))) : radial, sign);
+      };
+      return { id: e.id, kind: ang ? 'cone' : 'cylinder', loops, outer, nz: meanNz(loops, normalAt), z: 0, flat: false, surf: { F, r, ang: ang || undefined, sign } };
     }
     if (s.type === 'CYLINDRICAL_SURFACE') return { id: e.id, kind: 'cylinder', loops, outer, nz: 0, z: 0, flat: false, surf: { F, r, sign } };
-    const ang = num(s.args[3]);                          // semi-angle (radians in plane-angle unit)
     // outward normal of a cone at u=0: x - tan(a) * axis
     const nz = dot(norm(sub(F.x, scale(F.z, Math.tan(ang)))), [0, 0, 1]) * sign;
     return { id: e.id, kind: 'cone', loops, outer, nz, z: 0, flat: false, surf: { F, r, ang, sign } };
+  };
+
+  /** Tori, spheres and other surfaces (rounded corners, hardware): side faces, no mesh yet. */
+  const otherFace = (e: Entity, s: Entity, sign: number): Face => {
+    const loops: V3[][] = [];
+    let outer = -1;
+    for (const bv of e.args[1] as Value[]) {
+      const b = ent(bv, 'bound');
+      if (b.type === 'FACE_OUTER_BOUND') outer = loops.length;
+      loops.push(loopPoints(b.args[1]));
+    }
+    const F = s.args[1] instanceof Ref && E.get(s.args[1].id)?.type === 'AXIS2_PLACEMENT_3D' ? frame(s.args[1]) : null;
+    let normalAt: ((p: V3) => V3) | null = null;
+    if (F && s.type === 'SPHERICAL_SURFACE') normalAt = (p) => scale(norm(sub(p, F.o)), sign);
+    if (F && s.type === 'TOROIDAL_SURFACE') {
+      const R = num(s.args[2]) * mmPer;
+      normalAt = (p) => {
+        const d = sub(p, F.o);
+        const ring = add(F.o, scale(norm(sub(d, scale(F.z, dot(d, F.z)))), R));
+        return scale(norm(sub(p, ring)), sign);
+      };
+    }
+    if (!normalAt) warnings.push(`Surface type ${s.parts ? Object.keys(s.parts).join(' + ') : s.type} (face #${e.id}) is read as a side face.`);
+    return { id: e.id, kind: 'other', loops, outer, nz: normalAt ? meanNz(loops, normalAt) : 0, z: 0, flat: false, surf: { F: F ?? { o: [0, 0, 0], x: [1, 0, 0], y: [0, 1, 0], z: [0, 0, 1] }, sign } };
   };
 
   /** A B-spline face: a side wall straight through the board, or a flat face. */
@@ -352,6 +433,7 @@ export function readModel(f: StepFile, opt: ReadOptions = {}): StepModel {
 
   // ---- tessellation for the 3D view
   const meshFace = (fc: Face, P: number[], N: number[], I: number[]) => {
+    if (fc.kind === 'other') return; // no tessellation for these yet
     const base = P.length / 3;
     if (fc.kind === 'plane') {
       const n = fc.n!;
@@ -465,14 +547,7 @@ export function readModel(f: StepFile, opt: ReadOptions = {}): StepModel {
 
   // ---- solids
   const solids: { name: string; faces: Face[] }[] = [];
-  const brepIds = [...(f.byType.get('MANIFOLD_SOLID_BREP') || []), ...(f.byType.get('BREP_WITH_VOIDS') || [])];
-  if (!brepIds.length) {
-    const shells = f.byType.get('SHELL_BASED_SURFACE_MODEL');
-    throw new StepError(shells ? 'The file holds surface models, not solids. Export the parts as solid bodies.' : 'No solid bodies were found in the file.');
-  }
-  const unsupportedXf = (f.byType.get('ITEM_DEFINED_TRANSFORMATION') || []).length;
-  if (unsupportedXf) warnings.push(`The file contains ${unsupportedXf} assembly placement(s); parts are read at their stored positions.`);
-  for (const id of brepIds) {
+  for (const id of ids) {
     const b = E.get(id)!;
     const shell = ent(b.args[1], 'shell');
     const faces = (shell.args[1] as Value[]).map((fv) => face(ent(fv, 'face')));
@@ -533,14 +608,7 @@ export function readModel(f: StepFile, opt: ReadOptions = {}): StepModel {
     };
   });
 
-  const bx = parts.map((p) => p.bbox);
-  const fn = f.header.FILE_NAME;
-  return {
-    source: fn ? String((fn[3] as Value[])?.[0] ?? fn[0] ?? '') : '',
-    unit, parts, warnings, turned,
-    bbox: [Math.min(...bx.map((b) => b[0])), Math.min(...bx.map((b) => b[1])), Math.max(...bx.map((b) => b[2])), Math.max(...bx.map((b) => b[3]))],
-    thickness: Math.max(...parts.map((p) => p.thickness)),
-  };
+  return parts;
 }
 
 const r3 = (v: number) => Math.round(v * 1000) / 1000;
