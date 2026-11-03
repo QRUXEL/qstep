@@ -4,3 +4,8 @@ export * from "./brep";
 export * from "./geom/clip";
 export * from "./assembly";
 export * from "./board";
+export * from "./surface";
+export * from "./tess";
+export * from "./read";
+export * from "./facemesh";
+export * from "./meshes";

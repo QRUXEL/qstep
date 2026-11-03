@@ -33,6 +33,8 @@ export interface Assembly {
   roots: AssemblyNode[];
   /** solid id → colour, 0..1 */
   colors: Map<number, V3>;
+  /** face id → colour, for files that colour faces rather than solids */
+  faceColors: Map<number, V3>;
   /** solid id → name */
   solidNames: Map<number, string>;
   /** millimetres per file length unit */
@@ -219,8 +221,9 @@ export function readAssembly(f: StepFile): Assembly {
 
   // ---- colours: the first COLOUR_RGB under a styled item that points at a solid
   const colors = new Map<number, V3>();
+  const faceColors = new Map<number, V3>();
   const findColor = (v: Value | undefined, depth: number): V3 | null => {
-    if (depth > 8) return null;
+    if (depth > 16) return null;
     if (Array.isArray(v)) { for (const x of v) { const c = findColor(x, depth + 1); if (c) return c; } return null; }
     const e = get(v);
     if (!e) return null;
@@ -232,14 +235,16 @@ export function readAssembly(f: StepFile): Assembly {
     for (const id of ids(type)) {
       const e = E.get(id)!;
       const target = get(e.args[2]);
-      if (!target || !SOLID_TYPES.includes(target.type) || colors.has(target.id)) continue;
+      if (!target) continue;
+      const solid = SOLID_TYPES.includes(target.type);
+      if (solid ? colors.has(target.id) : target.type !== 'ADVANCED_FACE' || faceColors.has(target.id)) continue;
       const c = findColor(e.args[1], 0);
-      if (c) colors.set(target.id, c);
+      if (c) (solid ? colors : faceColors).set(target.id, c);
     }
   }
   const solidNames = new Map<number, string>();
   for (const id of SOLID_TYPES.flatMap(ids)) solidNames.set(id, text(E.get(id)!.args[0]));
-  return { roots, colors, solidNames, mmPer, warnings };
+  return { roots, colors, faceColors, solidNames, mmPer, warnings };
 }
 
 export function allSolids(nodes: AssemblyNode[]): number[] {
