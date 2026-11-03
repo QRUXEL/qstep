@@ -1,0 +1,26 @@
+{
+  "name": "@qruxel/step",
+  "version": "0.1.0",
+  "description": "STEP (ISO 10303-21) reader for sheet-material parts and their assemblies: parser, B-rep reader, outlines, pockets and meshes. Shared by ManualNest and Baluster Studio.",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "files": ["src"],
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit -p ."
+  },
+  "dependencies": {
+    "clipper-lib": "^6.4.2",
+    "earcut": "^3.2.4"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.0",
+    "@types/earcut": "^3.2.4",
+    "typescript": "~5.9.3"
+  }
+}
