@@ -21,7 +21,11 @@ export interface TessOptions {
   maxAngle: number;
   /** cap on strips and rows per face */
   maxSteps?: number;
-  /** boundary points closer than this to the line through their neighbours are dropped, mm */
+  /**
+   * boundary points closer than this to the line through their neighbours are dropped, mm.
+   * Keep it small: a kept stretch is a straight line in (u, v), not in 3D, so where the face
+   * bends along it (a flat cut through a cone) the mesh leaves the true edge by more than this.
+   */
   tol?: number;
 }
 
@@ -70,7 +74,7 @@ export function tessellate(S: Param, loops3: V3[][], sign: number, o: TessOption
   const loops: UV[][] = [];
   for (let l3 of loops3) {
     if (l3.length < 2) continue;
-    l3 = simplifyLoop(l3, o.tol ?? 0.05);
+    l3 = simplifyLoop(l3, o.tol ?? 0.001);
     let hint: UV | null = null;
     const raw: UV[] = l3.map((p) => { const q = S.inv(p, hint); hint = q; return q; });
     // poles (and cone apexes): u means nothing where the surface collapses to a point;
